@@ -64,7 +64,6 @@ class HITLSignal:
 class CyclicDependencyError(Exception):
     """Raised when the task graph contains a cycle."""
 
-
 # ── 2. PERSISTENCE (SQLite) ──────────────────────────────────────
 # Every state transition writes a row; replay from DB recovers in-flight
 # workflows after a crash. No ORM — raw sqlite3 throughout.
@@ -397,16 +396,7 @@ def _run_workflow(wf: Workflow, db_path: str, sink: Callable[[dict], None]) -> d
                 if task_result.status == "failed":
                     _cancel_downstream(wf.tasks[tid], wf.tasks, results, wf.id, db_path, emitter)
 
-            if _all_success(wf.tasks, results):
-                emitter.emit(wf.id, "", "workflow_completed", {"task_count": len(wf.tasks)})
-                return results
-
-            if _any_failed(wf.tasks, results) and not in_flight:
-                emitter.emit(wf.id, "", "workflow_failed",
-                             {"failed_tasks": [tid for tid, r in results.items() if r.status == "failed"]})
-                return results
-
-            # Submit newly-ready tasks
+            # Submit ready tasks first so new work is queued before exit check.
             result_store = _build_result_store(wf.tasks, results)
             for task in _ready_tasks(wf.tasks, results):
                 if task.id in in_flight:
@@ -416,6 +406,16 @@ def _run_workflow(wf: Workflow, db_path: str, sink: Callable[[dict], None]) -> d
                 in_flight[task.id] = executor.submit(
                     runner, task, wf.context, result_store, wf.id, db_path, emitter
                 )
+
+            if _all_success(wf.tasks, results):
+                emitter.emit(wf.id, "", "workflow_completed", {"task_count": len(wf.tasks)})
+                return results
+
+            if _any_failed(wf.tasks, results) and not in_flight:
+                emitter.emit(wf.id, "", "workflow_failed",
+                             {"failed_tasks": [tid for tid, r in results.items() if r.status == "failed"]})
+                return results
+
             time.sleep(TICK_INTERVAL)
     finally:
         executor.shutdown(wait=False)

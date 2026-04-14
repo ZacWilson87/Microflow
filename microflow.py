@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable, Literal
@@ -298,7 +298,29 @@ def _build_result_store(tasks: dict[str, Task], results: dict[str, TaskResult]) 
 # ── 5. RETRY ENGINE ──────────────────────────────────────────────
 # Exponential backoff: delay = retry_delay_s * (2 ** attempt)
 # On final failure: set status 'failed', emit event, do not raise.
-# Timeout enforced via Future.result(timeout=...).
+# Timeout enforced by running task.fn in a fresh daemon thread and
+# joining with a timeout — avoids deadlock from nested executor calls.
+
+def _call_with_timeout(fn: Callable, args: tuple, timeout_s: float | None) -> Any:
+    """Call fn(*args) in a daemon thread. Raises TimeoutError or re-raises fn's exception."""
+    holder: dict = {}
+
+    def _target():
+        try:
+            holder["output"] = fn(*args)
+        except Exception as exc:
+            holder["error"] = exc
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout_s)
+
+    if t.is_alive():
+        raise TimeoutError(f"Task timed out after {timeout_s}s")
+    if "error" in holder:
+        raise holder["error"]
+    return holder.get("output")
+
 
 def _run_with_retry(
     task: Task,
@@ -307,7 +329,6 @@ def _run_with_retry(
     workflow_id: str,
     db_path: str,
     emitter: _Emitter,
-    executor: ThreadPoolExecutor,
 ) -> TaskResult:
     """Execute *task* with retries + timeout. Returns final TaskResult."""
     started_at = time.time()
@@ -326,9 +347,8 @@ def _run_with_retry(
         _persist_result(result, workflow_id, db_path)
         emitter.emit(workflow_id, task.id, "task_started", {"attempt": attempt})
 
-        future: Future = executor.submit(task.fn, context, result_store)
         try:
-            output = future.result(timeout=task.timeout_s)
+            output = _call_with_timeout(task.fn, (context, result_store), task.timeout_s)
             finished = TaskResult(
                 task_id=task.id, status="success",
                 output=output, error=None,
@@ -338,9 +358,8 @@ def _run_with_retry(
             emitter.emit(workflow_id, task.id, "task_succeeded", {"attempt": attempt, "output": output})
             return finished
 
-        except FuturesTimeoutError:
-            err = f"Task timed out after {task.timeout_s}s"
-            future.cancel()
+        except TimeoutError as exc:
+            err = str(exc)
         except Exception as exc:
             err = str(exc)
 
@@ -399,7 +418,6 @@ def _run_hitl_task(
     workflow_id: str,
     db_path: str,
     emitter: _Emitter,
-    executor: ThreadPoolExecutor,
 ) -> TaskResult:
     """Handle a HITL task: block until signal, then approve/reject."""
     started_at = time.time()
@@ -438,7 +456,7 @@ def _run_hitl_task(
 
     # approve or override: merge payload into context and run the task
     context.update(sig.payload)
-    return _run_with_retry(task, context, result_store, workflow_id, db_path, emitter, executor)
+    return _run_with_retry(task, context, result_store, workflow_id, db_path, emitter)
 
 
 # ── 7. OBSERVABILITY EMITTER ─────────────────────────────────────
@@ -545,7 +563,7 @@ def _run_workflow(
 
                 fut = executor.submit(
                     runner, task, wf.context, result_store,
-                    wf.id, db_path, emitter, executor,
+                    wf.id, db_path, emitter,
                 )
                 in_flight[task.id] = fut
 

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import queue as _queue_module
 import sqlite3
 import threading
 import time
@@ -17,16 +18,16 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable, Literal
 
-TICK_INTERVAL = 0.1          # seconds between scheduler ticks
-_HITL_ATTR    = "_hitl_required"  # marker attribute set by @hitl_required
+TICK_INTERVAL = 0.1        # seconds between scheduler ticks
+_HITL_ATTR    = "_hitl_required"
 
 
 @dataclass
 class Task:
-    id: str                                   # uuid4
+    id: str
     name: str
-    fn: Callable                              # the actual work
-    depends_on: list[str] = field(default_factory=list)   # task IDs that must complete first
+    fn: Callable
+    depends_on: list[str] = field(default_factory=list)
     retry_limit: int = 3
     retry_delay_s: float = 1.0
     timeout_s: float | None = None
@@ -45,10 +46,10 @@ class TaskResult:
 
 @dataclass
 class Workflow:
-    id: str                            # uuid4
+    id: str
     name: str
-    tasks: dict[str, Task]             # task_id -> Task
-    context: dict                      # shared mutable state passed to all tasks
+    tasks: dict[str, Task]   # task_id -> Task
+    context: dict            # shared mutable state passed to all tasks
     created_at: float
 
 
@@ -57,7 +58,7 @@ class HITLSignal:
     workflow_id: str
     task_id: str
     signal: Literal["approve", "reject", "override"]
-    payload: dict                      # arbitrary reviewer-provided data
+    payload: dict
 
 
 class CyclicDependencyError(Exception):
@@ -65,46 +66,29 @@ class CyclicDependencyError(Exception):
 
 
 # ── 2. PERSISTENCE (SQLite) ──────────────────────────────────────
-# Every state transition writes a row. On startup, replay from DB
-# to recover in-flight workflows. No ORM — raw sqlite3 throughout.
+# Every state transition writes a row; replay from DB recovers in-flight
+# workflows after a crash. No ORM — raw sqlite3 throughout.
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflows (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    context    JSON NOT NULL,
-    created_at REAL NOT NULL
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, context JSON NOT NULL, created_at REAL NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS task_results (
-    id          TEXT PRIMARY KEY,
-    workflow_id TEXT NOT NULL,
-    task_id     TEXT NOT NULL,
-    status      TEXT NOT NULL,
-    output      JSON,
-    error       TEXT,
-    attempt     INTEGER NOT NULL DEFAULT 0,
-    started_at  REAL NOT NULL,
-    finished_at REAL,
+    id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, task_id TEXT NOT NULL,
+    status TEXT NOT NULL, output JSON, error TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+    started_at REAL NOT NULL, finished_at REAL,
     FOREIGN KEY (workflow_id) REFERENCES workflows(id)
 );
-
 CREATE TABLE IF NOT EXISTS hitl_signals (
-    id          TEXT PRIMARY KEY,
-    workflow_id TEXT NOT NULL,
-    task_id     TEXT NOT NULL,
-    signal      TEXT NOT NULL,
-    payload     JSON NOT NULL,
-    created_at  REAL NOT NULL
+    id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, task_id TEXT NOT NULL,
+    signal TEXT NOT NULL, payload JSON NOT NULL, created_at REAL NOT NULL
 );
 """
 
-# Thread-local SQLite connections: one connection per thread, created on demand.
-_conn_local = threading.local()
+_conn_local = threading.local()  # one connection per thread per db_path
 
 
 def _get_conn(db_path: str) -> sqlite3.Connection:
-    """Return a thread-local connection to *db_path*, creating schema on first use."""
     key = f"conn_{db_path}"
     if not hasattr(_conn_local, key):
         conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -118,53 +102,37 @@ def _get_conn(db_path: str) -> sqlite3.Connection:
 def _persist_workflow(wf: Workflow, db_path: str) -> None:
     conn = _get_conn(db_path)
     conn.execute(
-        "INSERT OR REPLACE INTO workflows (id, name, context, created_at) VALUES (?,?,?,?)",
+        "INSERT OR REPLACE INTO workflows (id,name,context,created_at) VALUES (?,?,?,?)",
         (wf.id, wf.name, json.dumps(wf.context), wf.created_at),
     )
     conn.commit()
 
 
-def _persist_result(result: TaskResult, workflow_id: str, db_path: str) -> None:
+def _persist_result(r: TaskResult, workflow_id: str, db_path: str) -> None:
     conn = _get_conn(db_path)
     conn.execute(
-        """INSERT OR REPLACE INTO task_results
-           (id, workflow_id, task_id, status, output, error, attempt, started_at, finished_at)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        (
-            str(uuid.uuid4()),
-            workflow_id,
-            result.task_id,
-            result.status,
-            json.dumps(result.output),
-            result.error,
-            result.attempt,
-            result.started_at,
-            result.finished_at,
-        ),
+        "INSERT OR REPLACE INTO task_results "
+        "(id,workflow_id,task_id,status,output,error,attempt,started_at,finished_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (str(uuid.uuid4()), workflow_id, r.task_id, r.status,
+         json.dumps(r.output), r.error, r.attempt, r.started_at, r.finished_at),
     )
     conn.commit()
 
 
 def _load_results(workflow_id: str, db_path: str) -> dict[str, TaskResult]:
     """Load the *latest* TaskResult per task_id for a workflow."""
-    conn = _get_conn(db_path)
-    rows = conn.execute(
-        """SELECT task_id, status, output, error, attempt, started_at, finished_at
-           FROM task_results
-           WHERE workflow_id = ?
-           ORDER BY rowid ASC""",
-        (workflow_id,),
+    rows = _get_conn(db_path).execute(
+        "SELECT task_id,status,output,error,attempt,started_at,finished_at "
+        "FROM task_results WHERE workflow_id=? ORDER BY rowid ASC", (workflow_id,)
     ).fetchall()
     latest: dict[str, TaskResult] = {}
     for row in rows:
         latest[row["task_id"]] = TaskResult(
-            task_id=row["task_id"],
-            status=row["status"],
+            task_id=row["task_id"], status=row["status"],
             output=json.loads(row["output"]) if row["output"] is not None else None,
-            error=row["error"],
-            attempt=row["attempt"],
-            started_at=row["started_at"],
-            finished_at=row["finished_at"],
+            error=row["error"], attempt=row["attempt"],
+            started_at=row["started_at"], finished_at=row["finished_at"],
         )
     return latest
 
@@ -172,30 +140,28 @@ def _load_results(workflow_id: str, db_path: str) -> dict[str, TaskResult]:
 def _persist_signal(sig: HITLSignal, db_path: str) -> None:
     conn = _get_conn(db_path)
     conn.execute(
-        "INSERT INTO hitl_signals (id, workflow_id, task_id, signal, payload, created_at) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO hitl_signals (id,workflow_id,task_id,signal,payload,created_at) VALUES (?,?,?,?,?,?)",
         (str(uuid.uuid4()), sig.workflow_id, sig.task_id, sig.signal, json.dumps(sig.payload), time.time()),
     )
     conn.commit()
 
 
 def _load_workflow_row(workflow_id: str, db_path: str) -> sqlite3.Row | None:
-    conn = _get_conn(db_path)
-    return conn.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+    return _get_conn(db_path).execute(
+        "SELECT * FROM workflows WHERE id=?", (workflow_id,)
+    ).fetchone()
 
 
 # ── 3. DAG RESOLVER ──────────────────────────────────────────────
 # Kahn's algorithm: maintain in-degree counts; emit nodes whose
-# in-degree drops to zero. O(V + E). Cycle detection is free —
-# if the sorted list is shorter than the node count, a cycle exists.
+# in-degree drops to zero. O(V+E). Cycle detection is free —
+# if the sorted list is shorter than node count, a cycle exists.
 
 def _topological_sort(tasks: dict[str, Task]) -> list[str]:
     """Return task IDs in topological order. Raises CyclicDependencyError on cycle."""
-    # Build adjacency and in-degree maps keyed by task *name* (public) -> task id
     name_to_id = {t.name: t.id for t in tasks.values()}
-
     in_degree: dict[str, int] = {tid: 0 for tid in tasks}
-    dependents: dict[str, list[str]] = defaultdict(list)  # tid -> [tids that depend on it]
-
+    dependents: dict[str, list[str]] = defaultdict(list)
     for task in tasks.values():
         for dep_name in task.depends_on:
             dep_id = name_to_id.get(dep_name)
@@ -203,10 +169,8 @@ def _topological_sort(tasks: dict[str, Task]) -> list[str]:
                 raise ValueError(f"Task '{task.name}' depends on unknown task '{dep_name}'")
             in_degree[task.id] += 1
             dependents[dep_id].append(task.id)
-
-    queue = deque(tid for tid, deg in in_degree.items() if deg == 0)
+    queue: deque[str] = deque(tid for tid, deg in in_degree.items() if deg == 0)
     order: list[str] = []
-
     while queue:
         tid = queue.popleft()
         order.append(tid)
@@ -214,37 +178,29 @@ def _topological_sort(tasks: dict[str, Task]) -> list[str]:
             in_degree[child_id] -= 1
             if in_degree[child_id] == 0:
                 queue.append(child_id)
-
     if len(order) != len(tasks):
         cycle_nodes = [tasks[tid].name for tid in tasks if tid not in set(order)]
         raise CyclicDependencyError(f"Cycle detected among tasks: {cycle_nodes}")
-
     return order
 
 
-def _ready_tasks(
-    tasks: dict[str, Task],
-    results: dict[str, TaskResult],
-) -> list[Task]:
+def _ready_tasks(tasks: dict[str, Task], results: dict[str, TaskResult]) -> list[Task]:
     """Return tasks whose dependencies are all 'success' and which haven't started."""
     name_to_result = {tasks[tid].name: results.get(tid) for tid in tasks}
     ready = []
     for task in tasks.values():
         if task.id in results:
-            continue  # already started or done
-        deps_satisfied = all(
-            name_to_result.get(dep) is not None
-            and name_to_result[dep].status == "success"
+            continue
+        if all(
+            name_to_result.get(dep) is not None and name_to_result[dep].status == "success"
             for dep in task.depends_on
-        )
-        if deps_satisfied:
+        ):
             ready.append(task)
     return ready
 
 
 def _all_success(tasks: dict[str, Task], results: dict[str, TaskResult]) -> bool:
-    return all(results.get(tid, None) is not None and results[tid].status == "success"
-               for tid in tasks)
+    return all(results.get(tid) is not None and results[tid].status == "success" for tid in tasks)
 
 
 def _any_failed(tasks: dict[str, Task], results: dict[str, TaskResult]) -> bool:
@@ -259,62 +215,48 @@ def _cancel_downstream(
     db_path: str,
     emitter: _Emitter,
 ) -> None:
-    """Mark all tasks transitively downstream of *failed_task* as cancelled."""
+    """Mark tasks transitively downstream of *failed_task* as cancelled (BFS)."""
     name_to_id = {t.name: t.id for t in tasks.values()}
-    # BFS over dependents
     to_cancel: set[str] = set()
-    frontier = deque([failed_task.name])
-    all_names = {t.name for t in tasks.values()}
+    frontier: deque[str] = deque([failed_task.name])
     while frontier:
-        src_name = frontier.popleft()
+        src = frontier.popleft()
         for task in tasks.values():
-            if src_name in task.depends_on and task.id not in results and task.name not in to_cancel:
+            if src in task.depends_on and task.id not in results and task.name not in to_cancel:
                 to_cancel.add(task.name)
                 frontier.append(task.name)
-
     now = time.time()
     for name in to_cancel:
         tid = name_to_id[name]
-        r = TaskResult(
-            task_id=tid, status="cancelled", output=None,
-            error="upstream task failed", attempt=0,
-            started_at=now, finished_at=now,
-        )
+        r = TaskResult(tid, "cancelled", None, "upstream task failed", 0, now, now)
         results[tid] = r
         _persist_result(r, workflow_id, db_path)
         emitter.emit(workflow_id, tid, "task_cancelled", {"reason": "upstream_failure"})
 
 
 # ── 4. EXECUTOR ──────────────────────────────────────────────────
-# Each task runs in its own thread via ThreadPoolExecutor.
+# Each task lifecycle function runs in a ThreadPoolExecutor thread.
 # Signature: fn(context: dict, result_store: dict) -> Any
-# result_store maps task *name* -> output of that task.
+# result_store maps task name -> output of completed tasks.
 
 def _build_result_store(tasks: dict[str, Task], results: dict[str, TaskResult]) -> dict:
-    """Build the accumulated outputs dict passed to each task function."""
     return {tasks[tid].name: results[tid].output for tid in results if results[tid].status == "success"}
-
 
 # ── 5. RETRY ENGINE ──────────────────────────────────────────────
 # Exponential backoff: delay = retry_delay_s * (2 ** attempt)
-# On final failure: set status 'failed', emit event, do not raise.
-# Timeout enforced by running task.fn in a fresh daemon thread and
-# joining with a timeout — avoids deadlock from nested executor calls.
+# Timeout via daemon Thread.join(timeout) — avoids nested executor deadlock.
 
 def _call_with_timeout(fn: Callable, args: tuple, timeout_s: float | None) -> Any:
-    """Call fn(*args) in a daemon thread. Raises TimeoutError or re-raises fn's exception."""
+    """Run fn(*args) in a daemon thread; raise TimeoutError or re-raise fn's exception."""
     holder: dict = {}
-
     def _target():
         try:
             holder["output"] = fn(*args)
         except Exception as exc:
             holder["error"] = exc
-
     t = threading.Thread(target=_target, daemon=True)
     t.start()
     t.join(timeout=timeout_s)
-
     if t.is_alive():
         raise TimeoutError(f"Task timed out after {timeout_s}s")
     if "error" in holder:
@@ -323,76 +265,42 @@ def _call_with_timeout(fn: Callable, args: tuple, timeout_s: float | None) -> An
 
 
 def _run_with_retry(
-    task: Task,
-    context: dict,
-    result_store: dict,
-    workflow_id: str,
-    db_path: str,
-    emitter: _Emitter,
+    task: Task, context: dict, result_store: dict,
+    workflow_id: str, db_path: str, emitter: _Emitter,
 ) -> TaskResult:
     """Execute *task* with retries + timeout. Returns final TaskResult."""
     started_at = time.time()
     attempt = 0
-
     while True:
-        result = TaskResult(
-            task_id=task.id,
-            status="running",
-            output=None,
-            error=None,
-            attempt=attempt,
-            started_at=started_at,
-            finished_at=None,
-        )
-        _persist_result(result, workflow_id, db_path)
+        _persist_result(TaskResult(task.id, "running", None, None, attempt, started_at, None),
+                        workflow_id, db_path)
         emitter.emit(workflow_id, task.id, "task_started", {"attempt": attempt})
-
         try:
             output = _call_with_timeout(task.fn, (context, result_store), task.timeout_s)
-            finished = TaskResult(
-                task_id=task.id, status="success",
-                output=output, error=None,
-                attempt=attempt, started_at=started_at, finished_at=time.time(),
-            )
-            _persist_result(finished, workflow_id, db_path)
+            r = TaskResult(task.id, "success", output, None, attempt, started_at, time.time())
+            _persist_result(r, workflow_id, db_path)
             emitter.emit(workflow_id, task.id, "task_succeeded", {"attempt": attempt, "output": output})
-            return finished
-
-        except TimeoutError as exc:
+            return r
+        except (TimeoutError, Exception) as exc:
             err = str(exc)
-        except Exception as exc:
-            err = str(exc)
-
         attempt += 1
         if attempt > task.retry_limit:
-            failed = TaskResult(
-                task_id=task.id, status="failed",
-                output=None, error=err,
-                attempt=attempt - 1, started_at=started_at, finished_at=time.time(),
-            )
-            _persist_result(failed, workflow_id, db_path)
+            r = TaskResult(task.id, "failed", None, err, attempt - 1, started_at, time.time())
+            _persist_result(r, workflow_id, db_path)
             emitter.emit(workflow_id, task.id, "task_failed", {"error": err, "attempt": attempt - 1})
-            return failed
-
+            return r
         delay = task.retry_delay_s * (2 ** attempt)
         emitter.emit(workflow_id, task.id, "task_retrying", {"attempt": attempt, "delay_s": delay})
         time.sleep(delay)
 
 
 # ── 6. HITL GATE ─────────────────────────────────────────────────
-# @hitl_required marks a task function. When the runner encounters it,
-# it sets status = waiting_hitl and blocks on a per-workflow Queue.
-# send_signal() drops a HITLSignal onto that queue.
-# approve  → task proceeds (payload merged into context)
-# reject   → task status becomes failed, downstream cancelled
-# override → same as approve but logs the override
+# @hitl_required marks a fn. Runner sets status=waiting_hitl and blocks.
+# approve/override → payload merged into context, task proceeds.
+# reject           → status=failed, downstream tasks cancelled.
 
-# Global registry: workflow_id -> Queue[HITLSignal]
-_hitl_queues: dict[str, "queue.Queue[HITLSignal]"] = {}
+_hitl_queues: dict[str, _queue_module.Queue] = {}
 _hitl_queues_lock = threading.Lock()
-
-# Import queue here to avoid shadowing the module name
-import queue as _queue_module
 
 
 def hitl_required(fn: Callable) -> Callable:
@@ -404,7 +312,7 @@ def hitl_required(fn: Callable) -> Callable:
     return wrapper
 
 
-def _get_hitl_queue(workflow_id: str) -> "_queue_module.Queue[HITLSignal]":
+def _get_hitl_queue(workflow_id: str) -> _queue_module.Queue:
     with _hitl_queues_lock:
         if workflow_id not in _hitl_queues:
             _hitl_queues[workflow_id] = _queue_module.Queue()
@@ -412,31 +320,19 @@ def _get_hitl_queue(workflow_id: str) -> "_queue_module.Queue[HITLSignal]":
 
 
 def _run_hitl_task(
-    task: Task,
-    context: dict,
-    result_store: dict,
-    workflow_id: str,
-    db_path: str,
-    emitter: _Emitter,
+    task: Task, context: dict, result_store: dict,
+    workflow_id: str, db_path: str, emitter: _Emitter,
 ) -> TaskResult:
-    """Handle a HITL task: block until signal, then approve/reject."""
+    """Handle a HITL task: block until signal arrives, then approve/reject."""
     started_at = time.time()
-
-    # Announce that we're waiting
-    waiting = TaskResult(
-        task_id=task.id, status="waiting_hitl",
-        output=None, error=None,
-        attempt=0, started_at=started_at, finished_at=None,
-    )
-    _persist_result(waiting, workflow_id, db_path)
+    _persist_result(TaskResult(task.id, "waiting_hitl", None, None, 0, started_at, None),
+                    workflow_id, db_path)
     emitter.emit(workflow_id, task.id, "hitl_waiting", {})
 
-    # Block until a signal arrives (no timeout — reviewer must decide)
     q = _get_hitl_queue(workflow_id)
     while True:
         sig: HITLSignal = q.get()
         if sig.task_id != task.id:
-            # Signal for a different task — put it back and wait again
             q.put(sig)
             time.sleep(0.05)
             continue
@@ -446,15 +342,11 @@ def _run_hitl_task(
     emitter.emit(workflow_id, task.id, "hitl_resolved", {"signal": sig.signal, "payload": sig.payload})
 
     if sig.signal == "reject":
-        failed = TaskResult(
-            task_id=task.id, status="failed",
-            output=None, error="rejected by reviewer",
-            attempt=0, started_at=started_at, finished_at=time.time(),
-        )
-        _persist_result(failed, workflow_id, db_path)
-        return failed
+        r = TaskResult(task.id, "failed", None, "rejected by reviewer", 0, started_at, time.time())
+        _persist_result(r, workflow_id, db_path)
+        return r
 
-    # approve or override: merge payload into context and run the task
+    # approve or override: merge payload into context, run normally
     context.update(sig.payload)
     return _run_with_retry(task, context, result_store, workflow_id, db_path, emitter)
 
@@ -468,150 +360,91 @@ def print_json_sink(event: dict) -> None:
     print(json.dumps(event))
 
 
-# Module-level default sink (mutable so register_sink() can swap it)
 _current_sink: Callable[[dict], None] = print_json_sink
 
 
 class _Emitter:
-    """Thin wrapper that attaches a sink and emits structured events."""
-
     def __init__(self, sink: Callable[[dict], None]) -> None:
         self._sink = sink
 
     def emit(self, workflow_id: str, task_id: str, event: str, payload: dict) -> None:
-        self._sink({
-            "ts": time.time(),
-            "workflow_id": workflow_id,
-            "task_id": task_id,
-            "event": event,
-            "payload": payload,
-        })
+        self._sink({"ts": time.time(), "workflow_id": workflow_id,
+                    "task_id": task_id, "event": event, "payload": payload})
 
 
 # ── 8. WORKFLOW RUNNER ───────────────────────────────────────────
-# Main loop ticks every TICK_INTERVAL seconds.
-# Each tick: resolve ready tasks → submit to executor
-#           → collect completed futures → persist → emit.
+# Main loop ticks every TICK_INTERVAL seconds:
+#   resolve ready tasks → submit to executor → collect futures → persist → emit
 # run()       blocks until workflow finishes or fails.
-# run_async() starts run() in a background thread and returns it.
+# run_async() starts run() in a daemon thread and returns it.
 
-def _run_workflow(
-    wf: Workflow,
-    db_path: str,
-    sink: Callable[[dict], None],
-) -> dict[str, TaskResult]:
+def _run_workflow(wf: Workflow, db_path: str, sink: Callable[[dict], None]) -> dict[str, TaskResult]:
     """Core blocking runner. Returns final results dict keyed by task_id."""
-
-    # Validate DAG up-front (raises CyclicDependencyError if bad)
-    _topological_sort(wf.tasks)
-
+    _topological_sort(wf.tasks)   # validate DAG; raises CyclicDependencyError if bad
     emitter = _Emitter(sink)
     _persist_workflow(wf, db_path)
-
-    # Recover any already-persisted results (for crash-resume)
-    results: dict[str, TaskResult] = _load_results(wf.id, db_path)
-
-    # Track in-flight futures: task_id -> Future
+    results: dict[str, TaskResult] = _load_results(wf.id, db_path)   # crash-resume
     in_flight: dict[str, Future] = {}
-
-    # We use a single ThreadPoolExecutor for the whole workflow.
-    # Max workers = number of tasks (worst case all run in parallel).
-    max_workers = max(1, len(wf.tasks))
-    executor = ThreadPoolExecutor(max_workers=max_workers)
-
-    # Ensure HITL queue exists
-    _get_hitl_queue(wf.id)
+    executor = ThreadPoolExecutor(max_workers=max(1, len(wf.tasks)))
+    _get_hitl_queue(wf.id)  # ensure queue exists before tasks start
 
     try:
         while True:
-            # --- Collect finished in-flight tasks ---
-            done_ids = [tid for tid, fut in in_flight.items() if fut.done()]
-            for tid in done_ids:
+            # Collect finished in-flight tasks
+            for tid in [tid for tid, fut in in_flight.items() if fut.done()]:
                 task_result: TaskResult = in_flight.pop(tid).result()
                 results[tid] = task_result
                 if task_result.status == "failed":
                     _cancel_downstream(wf.tasks[tid], wf.tasks, results, wf.id, db_path, emitter)
 
-            # --- Check terminal conditions ---
             if _all_success(wf.tasks, results):
-                emitter.emit(wf.id, "", "workflow_completed", {
-                    "task_count": len(wf.tasks)
-                })
+                emitter.emit(wf.id, "", "workflow_completed", {"task_count": len(wf.tasks)})
                 return results
 
             if _any_failed(wf.tasks, results) and not in_flight:
-                emitter.emit(wf.id, "", "workflow_failed", {
-                    "failed_tasks": [tid for tid, r in results.items() if r.status == "failed"]
-                })
+                emitter.emit(wf.id, "", "workflow_failed",
+                             {"failed_tasks": [tid for tid, r in results.items() if r.status == "failed"]})
                 return results
 
-            # --- Submit ready tasks ---
+            # Submit newly-ready tasks
             result_store = _build_result_store(wf.tasks, results)
             for task in _ready_tasks(wf.tasks, results):
                 if task.id in in_flight:
                     continue
-                # Reserve slot immediately so we don't double-submit
-                placeholder = TaskResult(
-                    task_id=task.id, status="running",
-                    output=None, error=None,
-                    attempt=0, started_at=time.time(), finished_at=None,
+                results[task.id] = TaskResult(task.id, "running", None, None, 0, time.time(), None)
+                runner = _run_hitl_task if getattr(task.fn, _HITL_ATTR, False) else _run_with_retry
+                in_flight[task.id] = executor.submit(
+                    runner, task, wf.context, result_store, wf.id, db_path, emitter
                 )
-                results[task.id] = placeholder
-
-                is_hitl = getattr(task.fn, _HITL_ATTR, False)
-                runner = _run_hitl_task if is_hitl else _run_with_retry
-
-                fut = executor.submit(
-                    runner, task, wf.context, result_store,
-                    wf.id, db_path, emitter,
-                )
-                in_flight[task.id] = fut
-
             time.sleep(TICK_INTERVAL)
     finally:
         executor.shutdown(wait=False)
 
 
 # ── 9. PUBLIC API ────────────────────────────────────────────────
-# Eight functions are the entire public surface of microflow.
+# These 8 functions are the entire public surface of microflow.
 
 def create_workflow(name: str, context: dict | None = None) -> Workflow:
     """Create a new Workflow object. Does not persist or run it yet."""
-    return Workflow(
-        id=str(uuid.uuid4()),
-        name=name,
-        tasks={},
-        context=context or {},
-        created_at=time.time(),
-    )
+    return Workflow(id=str(uuid.uuid4()), name=name, tasks={},
+                    context=context or {}, created_at=time.time())
 
 
 def add_task(
-    workflow: Workflow,
-    name: str,
-    fn: Callable,
+    workflow: Workflow, name: str, fn: Callable,
     depends_on: list[str] | None = None,
-    retry_limit: int = 3,
-    retry_delay_s: float = 1.0,
-    timeout_s: float | None = None,
+    retry_limit: int = 3, retry_delay_s: float = 1.0, timeout_s: float | None = None,
 ) -> Task:
     """Add a task to *workflow* and return the Task object."""
-    task = Task(
-        id=str(uuid.uuid4()),
-        name=name,
-        fn=fn,
-        depends_on=depends_on or [],
-        retry_limit=retry_limit,
-        retry_delay_s=retry_delay_s,
-        timeout_s=timeout_s,
-    )
+    task = Task(id=str(uuid.uuid4()), name=name, fn=fn,
+                depends_on=depends_on or [], retry_limit=retry_limit,
+                retry_delay_s=retry_delay_s, timeout_s=timeout_s)
     workflow.tasks[task.id] = task
     return task
 
 
 def run(
-    workflow: Workflow,
-    db_path: str = "microflow.db",
+    workflow: Workflow, db_path: str = "microflow.db",
     sink: Callable[[dict], None] | None = None,
 ) -> dict[str, TaskResult]:
     """Run *workflow* synchronously. Returns dict[task_id -> TaskResult]."""
@@ -619,29 +452,22 @@ def run(
 
 
 def run_async(
-    workflow: Workflow,
-    db_path: str = "microflow.db",
+    workflow: Workflow, db_path: str = "microflow.db",
     sink: Callable[[dict], None] | None = None,
 ) -> threading.Thread:
     """Run *workflow* in a background thread. Returns the Thread (already started)."""
-    t = threading.Thread(
-        target=_run_workflow,
-        args=(workflow, db_path, sink or _current_sink),
-        daemon=True,
-        name=f"microflow-{workflow.id[:8]}",
-    )
+    t = threading.Thread(target=_run_workflow,
+                         args=(workflow, db_path, sink or _current_sink),
+                         daemon=True, name=f"microflow-{workflow.id[:8]}")
     t.start()
     return t
 
 
 def send_signal(
-    workflow_id: str,
-    task_id: str,
-    signal: str,
-    payload: dict | None = None,
-    db_path: str = "microflow.db",
+    workflow_id: str, task_id: str, signal: str,
+    payload: dict | None = None, db_path: str = "microflow.db",
 ) -> None:
-    """Send a HITL signal to a waiting task. *signal* must be approve/reject/override."""
+    """Send a HITL signal to a waiting task. signal must be approve/reject/override."""
     if signal not in ("approve", "reject", "override"):
         raise ValueError(f"Invalid signal '{signal}'. Must be approve, reject, or override.")
     sig = HITLSignal(workflow_id=workflow_id, task_id=task_id,
@@ -649,35 +475,23 @@ def send_signal(
     _get_hitl_queue(workflow_id).put(sig)
 
 
-def get_status(
-    workflow_id: str,
-    db_path: str = "microflow.db",
-) -> dict[str, TaskResult]:
+def get_status(workflow_id: str, db_path: str = "microflow.db") -> dict[str, TaskResult]:
     """Load and return the latest TaskResult for every task in *workflow_id*."""
     return _load_results(workflow_id, db_path)
 
 
-def replay(
-    workflow_id: str,
-    db_path: str = "microflow.db",
-) -> Workflow:
+def replay(workflow_id: str, db_path: str = "microflow.db") -> Workflow:
     """Reconstruct a Workflow shell from persisted data (tasks not re-attached).
 
-    # TODO: full replay would require serialising the task *functions* themselves,
-    # which is not trivially safe. This returns a Workflow with empty tasks dict
-    # so callers can at least inspect context and identity. For re-execution,
-    # re-register tasks against the returned workflow before calling run().
+    # TODO: full replay requires serialising task *functions*, which is not
+    # trivially safe. Returns a Workflow with empty tasks dict so callers can
+    # inspect context/identity. Re-register tasks before calling run() again.
     """
     row = _load_workflow_row(workflow_id, db_path)
     if row is None:
         raise KeyError(f"No workflow with id={workflow_id!r} in {db_path!r}")
-    return Workflow(
-        id=row["id"],
-        name=row["name"],
-        tasks={},
-        context=json.loads(row["context"]),
-        created_at=row["created_at"],
-    )
+    return Workflow(id=row["id"], name=row["name"], tasks={},
+                    context=json.loads(row["context"]), created_at=row["created_at"])
 
 
 def register_sink(sink: Callable[[dict], None]) -> None:

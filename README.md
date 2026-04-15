@@ -71,6 +71,45 @@ python examples/hitl_review.py
 python examples/retry_chaos.py
 ```
 
+## Hybrid Go/Python mode
+
+For workloads where Go's non-blocking scheduler and memory efficiency matter,
+microflow ships a bridge layer that lets you define workflows in Python and run
+them on a Go engine:
+
+```
+Python @task DSL  →  flow.json  →  Go engine  →  Python subprocesses
+   (bridge.py)                    (core/)           (worker.py)
+```
+
+**Build the engine:**
+```bash
+cd core && go build -o ../microflow-core . && cd ..
+```
+
+**Define and export a workflow:**
+```python
+# examples/hybrid_flow.py
+from bridge import task, Flow
+import examples.hybrid_tasks as t
+
+fetch = task(task_id="fetch", retries=2, timeout=15)(t.fetch_source_data)
+process = task(task_id="process", retries=1)(t.process_data)
+
+flow = Flow("my-pipeline", context={"source": "db"})
+flow.register(fetch)
+flow.register(process, depends_on=["fetch"])
+flow.export("flow.json")
+```
+
+**Run it:**
+```bash
+python examples/hybrid_flow.py          # generates flow.json
+./microflow-core run flow.json --worker worker.py
+```
+
+Events stream as JSON lines to stdout; the final summary prints to stderr.
+
 ## Running the server
 
 ```bash

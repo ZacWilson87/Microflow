@@ -1,0 +1,46 @@
+{
+  "name": "hybrid-data-pipeline",
+  "context": {
+    "source": "analytics-db"
+  },
+  "tasks": [
+    {
+      "task_id": "fetch_source_data",
+      "entrypoint": "examples.hybrid_tasks.fetch_source_data",
+      "runtime": "python3",
+      "retry_policy": {
+        "max": 2,
+        "backoff": "exponential"
+      },
+      "dependencies": [],
+      "timeout_sec": 15
+    },
+    {
+      "task_id": "process_data",
+      "entrypoint": "examples.hybrid_tasks.process_data",
+      "runtime": "python3",
+      "retry_policy": {
+        "max": 1,
+        "backoff": "exponential"
+      },
+      "dependencies": [
+        "fetch_source_data"
+      ],
+      "timeout_sec": 10
+    },
+    {
+      "task_id": "generate_report",
+      "entrypoint": "examples.hybrid_tasks.generate_report",
+      "runtime": "python3",
+      "retry_policy": {
+        "max": 0,
+        "backoff": "exponential"
+      },
+      "dependencies": [
+        "fetch_source_data",
+        "process_data"
+      ],
+      "timeout_sec": 10
+    }
+  ]
+}

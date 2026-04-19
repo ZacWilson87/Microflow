@@ -321,12 +321,13 @@ Both files use the same numbered section headers so you can jump between them:
 
 | Section | Python lines | Go lines |
 |---------|-------------|---------|
-| 1. Types & Constants | 1–65 | 1–85 |
-| 2. Persistence | 67–152 | 87–120 |
-| 3. DAG Resolver | 154–233 | 122–185 |
-| 4. Retry Engine | 236–293 | 187–270 |
-| 5. Scheduler | 295–421 | 272–330 |
-| 6. Observability | 353–372 | 332–345 |
-| 7/8. Public API | 424–501 | 347–510 |
+| 1. Types & Constants | 1–68 | 1–87 |
+| 2. Persistence | 70–156 | 89–133 |
+| 3. DAG Resolver | 159–246 | 135–241 |
+| 4–5. Executor & Retry | 248–303 | 243–334 |
+| 6. HITL Gate | 305–356 | 253–334 |
+| 7. Observability | 358–378 | 416–433 |
+| 8. Workflow Runner | 380–425 | 336–414 |
+| 9. Public API | 427–500 | 435–510 |
 
 The algorithm is the same. The idioms are different. That's the lesson.

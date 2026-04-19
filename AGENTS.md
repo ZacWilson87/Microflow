@@ -1,22 +1,31 @@
 # microflow — Agent Context
 
 ## What this project is
-microflow is a single-file Python implementation of an AI agent workflow engine.
-The entire engine lives in `microflow.py` (≤ 500 lines, zero stdlib-external deps).
-The optional server layer is in `server.py`.
+microflow is an AI agent workflow engine implemented twice — once in Python,
+once in Go — with identical philosophy: single file, ≤ 500 lines, zero
+external dependencies, every seam visible.
+
+- `microflow.py` — Python engine (SQLite persistence)
+- `microflow.go` — Go engine (JSON file persistence)
+- `server.py` — optional FastAPI server wrapping the Python engine
 
 ## Key invariants
-- `microflow.py` must remain ≤ 500 lines
-- `microflow.py` may only import from the Python stdlib
-- All public surface is the 8 functions in Section 9
-- SQLite is the only persistence mechanism
+- `microflow.py` must remain ≤ 500 lines, stdlib-only imports
+- `microflow.go` must remain ≤ 550 lines, no external module dependencies
+- Both files expose exactly 8 public functions (same surface, different language idioms)
+- No hybrid/subprocess architecture — each engine runs its own language natively
 
-## Running tests
+## Running Python tests
 ```bash
 pytest tests/
 ```
 
-## Running examples (pure Python engine)
+## Running Go tests
+```bash
+go test ./...
+```
+
+## Running Python examples
 ```bash
 python examples/hello_world.py
 python examples/parallel_fan.py
@@ -24,29 +33,12 @@ python examples/hitl_review.py
 python examples/retry_chaos.py
 ```
 
-## Hybrid Go/Python mode
-
-New files for the hybrid architecture:
-- `bridge.py` — `@task` decorator + `Flow.export()` → `flow.json`
-- `worker.py` — subprocess shim; Go calls `python3 worker.py <entrypoint> <args_json>`
-- `core/` — Go engine (types, DAG, executor, scheduler, CLI)
-- `examples/hybrid_tasks.py` — example task functions
-- `examples/hybrid_flow.py` — builds and exports `examples/flow.json`
-
-**Build:**
+## Running Go examples
 ```bash
-cd core && go build -o ../microflow-core . && cd ..
-```
-
-**Run hybrid example end-to-end:**
-```bash
-python examples/hybrid_flow.py
-./microflow-core run examples/flow.json --worker worker.py
-```
-
-**CLI flags:**
-```
-microflow-core run <flow.json> [--worker <path>] [--python <bin>]
+go run ./examples/go/hello_world
+go run ./examples/go/parallel_fan
+go run ./examples/go/hitl_review
+go run ./examples/go/retry_chaos
 ```
 
 ## Branch

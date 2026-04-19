@@ -294,3 +294,39 @@ This is the entire interface. You don't need to know about `_Emitter`, `_run_wit
 The best software systems are the ones you can hold in your head. microflow is ~500 lines because that's how many lines it takes — no fewer, no more. Every line earns its place.
 
 Build on top of it, fork it, learn from it. The algorithm is the product.
+
+---
+
+## Appendix: The Go Port
+
+`microflow.go` implements the same engine in Go. Reading both files side-by-side is the fastest way to see how the same concepts map onto two different language paradigms.
+
+### Key differences
+
+**Persistence** — Python uses SQLite (it's in the stdlib). Go's stdlib has no SQLite driver, so `microflow.go` writes the workflow state as a JSON file after every transition. The pedagogical point is identical: "durable execution means writing state after every step." A plain-text JSON file is arguably *more* transparent — you can `cat` it and read the state machine directly.
+
+**Concurrency** — Python uses `ThreadPoolExecutor` (a thread pool with a work queue). Go uses goroutines launched directly with `go runTask(...)`. Both run tasks concurrently; Go's scheduler is lighter and doesn't need a pool abstraction because goroutines are cheap enough to create on demand.
+
+**HITL** — Python uses a `queue.Queue` per workflow (a blocking FIFO). Go uses a `chan HITLSignal` with buffer size 1. Both block the task goroutine/thread until a reviewer sends a signal. The Go channel is more idiomatic: select-on-channel is the natural way to express "wait for one of several events."
+
+**Timeout** — Python spawns a daemon thread for the task function and uses `thread.join(timeout)` to bound the wait. Go uses `context.WithTimeout` and a `select` on the done channel vs. the context's Done channel — cleaner because the context cancellation propagates into any downstream calls the task function makes.
+
+**Error handling** — Python raises exceptions; Go returns `(value, error)` pairs. The retry loop structure is identical — the `for attempt := 0; attempt < maxAttempts; attempt++` loop in Go directly mirrors the Python `for attempt in range(max_attempts)` loop.
+
+**Options pattern** — Python uses keyword arguments (`add_task(wf, "name", fn, retries=3, timeout=10.0)`). Go uses the functional options pattern (`AddTask(wf, "name", fn, WithRetries(3), WithTimeout(10.0))`). Both are zero-magic: you can trace exactly what each option does.
+
+### Same section structure
+
+Both files use the same numbered section headers so you can jump between them:
+
+| Section | Python lines | Go lines |
+|---------|-------------|---------|
+| 1. Types & Constants | 1–65 | 1–85 |
+| 2. Persistence | 67–152 | 87–120 |
+| 3. DAG Resolver | 154–233 | 122–185 |
+| 4. Retry Engine | 236–293 | 187–270 |
+| 5. Scheduler | 295–421 | 272–330 |
+| 6. Observability | 353–372 | 332–345 |
+| 7/8. Public API | 424–501 | 347–510 |
+
+The algorithm is the same. The idioms are different. That's the lesson.
